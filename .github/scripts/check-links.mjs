@@ -43,19 +43,26 @@ function walk(dir, acc = []) {
 
 const allFiles = walk(repoRoot).map((f) => path.relative(repoRoot, f).split(path.sep).join("/"));
 
+/**
+ * Schemes that are safe to reference from a document. This is deliberately a
+ * positive allow-list: anything else that carries a scheme (`javascript:`,
+ * `vbscript:`, `data:`, ...) can execute code in the browser and is reported
+ * as a problem rather than being silently ignored.
+ */
+const SAFE_SCHEME = /^(?:https?|mailto|tel|ftp|sms|geo):/i;
+
+/** Matches the scheme of a URL, if it has one. */
+const URL_SCHEME = /^([a-z][a-z0-9+.-]*):/i;
+
 function isExternal(url) {
   return (
     url === "" ||
     url.startsWith("#") ||
     url.startsWith("//") ||
-    url.startsWith("data:") ||
-    url.startsWith("mailto:") ||
-    url.startsWith("tel:") ||
-    url.startsWith("javascript:") ||
     url.startsWith("{%") ||
     url.includes("${") ||
     url.startsWith("%PUBLIC_URL%") ||
-    /^[a-z][a-z0-9+.-]*:/i.test(url)
+    SAFE_SCHEME.test(url)
   );
 }
 
@@ -133,6 +140,19 @@ function lineOf(text, index) {
   return text.slice(0, index).split("\n").length;
 }
 
+/**
+ * Plain-HTTP references are blocked as mixed content when the site is served
+ * over HTTPS (which is the case on GitHub Pages / Netlify / Vercel), so they
+ * silently fail for every visitor. Loopback URLs are exempt because they are
+ * only meaningful on the author's own machine.
+ */
+const MIXED_CONTENT = /(?:src|href)\s*=\s*["']http:\/\/([^"'/]+)/gi;
+const MIXED_CONTENT_FETCH = /fetch\(\s*[`"']http:\/\/([^"'`/]+)/gi;
+
+function isLoopback(host) {
+  return host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "[::1]";
+}
+
 const HTML_ATTR = /(?:src|href|data-src|poster)\s*=\s*["']([^"']*)["']/gi;
 const CSS_URL = /url\(\s*["']?([^"')]+)["']?\s*\)/gi;
 const JS_IMPORT = /(?:^|\s)(?:import\s[^'"]*from\s*|import\s*|export\s[^'"]*from\s*|require\s*\(\s*)["']([^"']+)["']/gm;
@@ -147,6 +167,13 @@ for (const file of allFiles) {
   if (ext === ".html" || ext === ".htm") {
     for (const match of text.matchAll(HTML_ATTR)) {
       const url = match[1];
+      const scheme = url.trim().match(URL_SCHEME);
+      if (scheme && !SAFE_SCHEME.test(url.trim())) {
+        problems.push(
+          `${file}:${lineOf(text, match.index)}  unsupported URL scheme "${scheme[1]}:" - it can execute code in the browser: "${url}"`,
+        );
+        continue;
+      }
       if (!resolveReference(file, url, "asset")) {
         problems.push(`${file}:${lineOf(text, match.index)}  reference not found in repo: "${url}"`);
       }
@@ -156,6 +183,13 @@ for (const file of allFiles) {
   if (ext === ".css") {
     for (const match of text.matchAll(CSS_URL)) {
       const url = match[1];
+      const scheme = url.trim().match(URL_SCHEME);
+      if (scheme && !SAFE_SCHEME.test(url.trim())) {
+        problems.push(
+          `${file}:${lineOf(text, match.index)}  unsupported URL scheme "${scheme[1]}:" - it can execute code in the browser: "${url}"`,
+        );
+        continue;
+      }
       if (!resolveReference(file, url, "asset")) {
         problems.push(`${file}:${lineOf(text, match.index)}  url() not found in repo: "${url}"`);
       }
@@ -170,6 +204,26 @@ for (const file of allFiles) {
         problems.push(`${file}:${lineOf(text, match.index)}  module not found in repo: "${url}"`);
       }
     }
+  }
+
+  for (const match of text.matchAll(MIXED_CONTENT)) {
+    const host = match[1];
+    if (isLoopback(host)) {
+      problems.push(
+        `${file}:${lineOf(text, match.index)}  hard-coded local address "${host}" only works on the author's own machine: "http://${host}/..."`,
+      );
+      continue;
+    }
+    problems.push(
+      `${file}:${lineOf(text, match.index)}  plain-HTTP reference is blocked as mixed content on HTTPS sites: "http://${host}/..."`,
+    );
+  }
+
+  for (const match of text.matchAll(MIXED_CONTENT_FETCH)) {
+    if (isLoopback(match[1])) continue;
+    problems.push(
+      `${file}:${lineOf(text, match.index)}  plain-HTTP fetch() is blocked as mixed content on HTTPS sites: "http://${match[1]}/..."`,
+    );
   }
 }
 
